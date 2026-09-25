@@ -1,0 +1,13 @@
+// 新版协议：新增字段 3/4/5，age 在版本 3 移除，支持版本 1..3。
+package newshop;
+
+message User version 1..3 {
+    1: string name since 1;
+    2: int32 age since 1 until 2;
+    3: string email since 2;
+    4: bool active since 1;
+    5: bytes avatar since 3;
+}
+
+compat User 1 2;
+incompat User 1 3;

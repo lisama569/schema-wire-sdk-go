@@ -1,0 +1,7 @@
+// 旧版协议：仅认识字段 1、2，支持版本 1..2。
+package oldshop;
+
+message User version 1..2 {
+    1: string name since 1;
+    2: int32 age since 1;
+}
