@@ -1,0 +1,13 @@
+# evolv: 非 additive 演进示例。
+# 编号 1 在 v1..v2 是 int32 old；v3..v4 移除；v5 起被 string handle 复用。
+# 区间互不重叠，且 compat=none，故合法；旧字节仍可按其信封版本正确解码。
+package evolv;
+version 5;
+compat none;
+
+message Event {
+	1: int32  old    [until=2];
+	1: string handle [since=5];
+	2: int64  ts;
+	3: bool   flagged [since=4];
+}

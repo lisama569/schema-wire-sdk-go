@@ -1,0 +1,18 @@
+# demo: 纯新增式演进（compat additive）的用户事件协议
+package demo;
+version 3;
+compat additive;
+
+message Address {
+	1: string city;
+	2: string zip [since=2];
+}
+
+message User {
+	1: int64  id;
+	2: string name;
+	3: Address home    [since=2];
+	4: bool   active  [since=3];
+	5: bytes  avatar  [since=3];
+	6: float64 score  [since=3];
+}
