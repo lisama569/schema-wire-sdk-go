@@ -11,6 +11,7 @@ const (
 	ErrKindUnknownType                        // 未知类型引用
 	ErrKindBadVersionRange                    // 非法版本区间
 	ErrKindCompatConflict                     // 兼容性声明互相矛盾
+	ErrKindCodegenUnsafe                      // 能通过语义校验但生成的 Go 代码无法编译
 )
 
 // ParseError 表示语法解析错误。
@@ -45,6 +46,8 @@ func (k ErrKind) String() string {
 		return "非法版本区间"
 	case ErrKindCompatConflict:
 		return "兼容性声明矛盾"
+	case ErrKindCodegenUnsafe:
+		return "生成产物不可编译"
 	}
 	return "未知错误"
 }

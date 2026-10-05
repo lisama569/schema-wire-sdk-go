@@ -143,18 +143,37 @@ func emitEncode(b *strings.Builder, m *schema.Message, fields []*schema.Field) {
 func emitDecode(b *strings.Builder, m *schema.Message, fields []*schema.Field) {
 	fmt.Fprintf(b, "\n// Decode 解码数据；版本不兼容返回 wire.ErrIncompatibleVersion，\n")
 	fmt.Fprintf(b, "// 截断/越界等损坏数据返回 wire.ErrCorrupt。未知字段保留在 UnknownFields。\n")
-	fmt.Fprintf(b, "func (m *%s) Decode(data []byte) error {\n", m.Name)
-	b.WriteString("\td := wire.NewDecoder(data)\n")
+	fmt.Fprintf(b, "func (m *%s) Decode(data []byte) error {\n\treturn m.DecodeLimits(data, nil)\n}\n", m.Name)
+
+	fmt.Fprintf(b, "\n// DecodeLimits 在资源上限内解码；超限返回 wire.ErrLimitExceeded。\n")
+	fmt.Fprintf(b, "func (m *%s) DecodeLimits(data []byte, lim *wire.Limits) error {\n", m.Name)
+	b.WriteString("\td, err := wire.NewDecoderLimits(data, lim)\n\tif err != nil {\n\t\treturn err\n\t}\n")
+	b.WriteString("\treturn m.decodeFrom(d, false)\n}\n")
+
+	fmt.Fprintf(b, "\n// DecodeStrict 严格按数据自带版本解码：仅把该版本下有效的字段当作已知字段，\n")
+	fmt.Fprintf(b, "// 其余一律按未知字段保留（含原始字节），供跨版本中转逐字节透传。\n")
+	fmt.Fprintf(b, "func (m *%s) DecodeStrict(data []byte) error {\n\treturn m.DecodeStrictLimits(data, nil)\n}\n", m.Name)
+
+	fmt.Fprintf(b, "\n// DecodeStrictLimits 是 DecodeStrict 的资源上限变体。\n")
+	fmt.Fprintf(b, "func (m *%s) DecodeStrictLimits(data []byte, lim *wire.Limits) error {\n", m.Name)
+	b.WriteString("\td, err := wire.NewDecoderLimits(data, lim)\n\tif err != nil {\n\t\treturn err\n\t}\n")
+	b.WriteString("\treturn m.decodeFrom(d, true)\n}\n")
+
+	fmt.Fprintf(b, "\n// decodeFrom 从解码器读取消息体；strict 为 true 时启用严格版本判定。\n")
+	fmt.Fprintf(b, "func (m *%s) decodeFrom(d *wire.Decoder, strict bool) error {\n", m.Name)
 	b.WriteString("\tv, err := d.ReadVersion()\n\tif err != nil {\n\t\treturn err\n\t}\n")
 	fmt.Fprintf(b, "\tif err := wire.CheckVersion(v, %sMinVersion, %sMaxVersion); err != nil {\n\t\treturn err\n\t}\n",
 		m.Name, m.Name)
 	b.WriteString("\tm.UnknownFields = wire.UnknownSet{}\n")
 	b.WriteString("\tfor !d.Done() {\n")
+	b.WriteString("\t\tstart := d.Offset()\n")
 	b.WriteString("\t\tnum, wt, err := d.ReadTag()\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+	b.WriteString("\t\tknown := false\n")
 	b.WriteString("\t\tswitch num {\n")
 	for _, f := range fields {
 		name := schema.ExportedName(f.Name)
 		fmt.Fprintf(b, "\t\tcase %d:\n", f.Number)
+		fmt.Fprintf(b, "\t\t\tif strict && !(%s) {\n\t\t\t\tbreak\n\t\t\t}\n", fieldActive(f))
 		fmt.Fprintf(b, "\t\t\tif wt != %s {\n\t\t\t\treturn fmt.Errorf(\"%%w: 字段 %d 线上类型不符\", wire.ErrCorrupt)\n\t\t\t}\n",
 			wireTypeOf(f.Type), f.Number)
 		switch f.Type {
@@ -170,18 +189,23 @@ func emitDecode(b *strings.Builder, m *schema.Message, fields []*schema.Field) {
 			fmt.Fprintf(b, "\t\t\tval, err := d.ReadBytes()\n\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t\tm.%s = val\n", name)
 		default: // 嵌套消息
 			fmt.Fprintf(b, "\t\t\traw, err := d.ReadBytes()\n\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
-			fmt.Fprintf(b, "\t\t\tinner := &%s{}\n\t\t\tif err := inner.Decode(raw); err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t\tm.%s = inner\n", f.Type, name)
+			b.WriteString("\t\t\tsub, err := d.Derive(raw)\n\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
+			fmt.Fprintf(b, "\t\t\tinner := &%s{}\n\t\t\tif err := inner.decodeFrom(sub, strict); err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t\tm.%s = inner\n", f.Type, name)
 		}
+		b.WriteString("\t\t\tknown = true\n")
 	}
-	b.WriteString("\t\tdefault:\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\tif !known {\n")
+	b.WriteString("\t\t\tvar data []byte\n")
 	b.WriteString("\t\t\tswitch wt {\n")
 	b.WriteString("\t\t\tcase wire.TypeVarint:\n")
 	b.WriteString("\t\t\t\traw, err := d.ReadRawVarint()\n\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n")
-	b.WriteString("\t\t\t\tm.UnknownFields.Add(wire.UnknownField{Number: num, Type: wt, Data: raw})\n")
+	b.WriteString("\t\t\t\tdata = raw\n")
 	b.WriteString("\t\t\tcase wire.TypeBytes:\n")
 	b.WriteString("\t\t\t\traw, err := d.ReadBytes()\n\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n")
-	b.WriteString("\t\t\t\tm.UnknownFields.Add(wire.UnknownField{Number: num, Type: wt, Data: raw})\n")
+	b.WriteString("\t\t\t\tdata = raw\n")
 	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t\tm.UnknownFields.Add(wire.UnknownField{Number: num, Type: wt, Data: data, Raw: d.RawSince(start)})\n")
 	b.WriteString("\t\t}\n\t}\n\treturn nil\n}\n")
 }
 

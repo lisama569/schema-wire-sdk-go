@@ -67,6 +67,11 @@ func Validate(f *File) error {
 		}
 		seen[key] = cd.Compat
 	}
+
+	// 生成产物可编译性检查（在生成之前拒绝“校验通过但编译不过”的 schema）
+	if err := validateCodegen(f); err != nil {
+		return err
+	}
 	return nil
 }
 

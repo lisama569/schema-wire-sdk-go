@@ -48,7 +48,35 @@ func (m *User) EncodeVersion(v int) ([]byte, error) {
 // Decode 解码数据；版本不兼容返回 wire.ErrIncompatibleVersion，
 // 截断/越界等损坏数据返回 wire.ErrCorrupt。未知字段保留在 UnknownFields。
 func (m *User) Decode(data []byte) error {
-	d := wire.NewDecoder(data)
+	return m.DecodeLimits(data, nil)
+}
+
+// DecodeLimits 在资源上限内解码；超限返回 wire.ErrLimitExceeded。
+func (m *User) DecodeLimits(data []byte, lim *wire.Limits) error {
+	d, err := wire.NewDecoderLimits(data, lim)
+	if err != nil {
+		return err
+	}
+	return m.decodeFrom(d, false)
+}
+
+// DecodeStrict 严格按数据自带版本解码：仅把该版本下有效的字段当作已知字段，
+// 其余一律按未知字段保留（含原始字节），供跨版本中转逐字节透传。
+func (m *User) DecodeStrict(data []byte) error {
+	return m.DecodeStrictLimits(data, nil)
+}
+
+// DecodeStrictLimits 是 DecodeStrict 的资源上限变体。
+func (m *User) DecodeStrictLimits(data []byte, lim *wire.Limits) error {
+	d, err := wire.NewDecoderLimits(data, lim)
+	if err != nil {
+		return err
+	}
+	return m.decodeFrom(d, true)
+}
+
+// decodeFrom 从解码器读取消息体；strict 为 true 时启用严格版本判定。
+func (m *User) decodeFrom(d *wire.Decoder, strict bool) error {
 	v, err := d.ReadVersion()
 	if err != nil {
 		return err
@@ -58,12 +86,17 @@ func (m *User) Decode(data []byte) error {
 	}
 	m.UnknownFields = wire.UnknownSet{}
 	for !d.Done() {
+		start := d.Offset()
 		num, wt, err := d.ReadTag()
 		if err != nil {
 			return err
 		}
+		known := false
 		switch num {
 		case 1:
+			if strict && !(v >= 1) {
+				break
+			}
 			if wt != wire.TypeBytes {
 				return fmt.Errorf("%w: 字段 1 线上类型不符", wire.ErrCorrupt)
 			}
@@ -72,7 +105,11 @@ func (m *User) Decode(data []byte) error {
 				return err
 			}
 			m.Name = val
+			known = true
 		case 2:
+			if strict && !(v >= 1) {
+				break
+			}
 			if wt != wire.TypeVarint {
 				return fmt.Errorf("%w: 字段 2 线上类型不符", wire.ErrCorrupt)
 			}
@@ -81,21 +118,25 @@ func (m *User) Decode(data []byte) error {
 				return err
 			}
 			m.Age = int32(val)
-		default:
+			known = true
+		}
+		if !known {
+			var data []byte
 			switch wt {
 			case wire.TypeVarint:
 				raw, err := d.ReadRawVarint()
 				if err != nil {
 					return err
 				}
-				m.UnknownFields.Add(wire.UnknownField{Number: num, Type: wt, Data: raw})
+				data = raw
 			case wire.TypeBytes:
 				raw, err := d.ReadBytes()
 				if err != nil {
 					return err
 				}
-				m.UnknownFields.Add(wire.UnknownField{Number: num, Type: wt, Data: raw})
+				data = raw
 			}
+			m.UnknownFields.Add(wire.UnknownField{Number: num, Type: wt, Data: data, Raw: d.RawSince(start)})
 		}
 	}
 	return nil

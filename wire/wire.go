@@ -38,6 +38,9 @@ type UnknownField struct {
 	Number int
 	Type   WireType
 	Data   []byte // varint 的原始字节，或 length-delimited 的载荷
+	// Raw 非空时为该字段的完整原始编码（标签 + 载荷，含非紧凑写法），
+	// 重新编码时优先逐字节写回，保证中转不改动任何字节。
+	Raw []byte
 }
 
 // UnknownSet 是未知字段集合，按解码出现顺序保留。
@@ -49,8 +52,13 @@ type UnknownSet struct {
 func (u *UnknownSet) Add(f UnknownField) { u.Fields = append(u.Fields, f) }
 
 // EncodeTo 将全部未知字段按原顺序写入编码器。
+// 带 Raw 的字段逐字节写回原始编码；否则按 Number/Type/Data 重建。
 func (u *UnknownSet) EncodeTo(e *Encoder) {
 	for _, f := range u.Fields {
+		if len(f.Raw) > 0 {
+			e.WriteRaw(f.Raw)
+			continue
+		}
 		e.WriteTag(f.Number, f.Type)
 		switch f.Type {
 		case TypeVarint:
@@ -85,6 +93,9 @@ func (e *Encoder) Bytes() []byte { return e.buf }
 
 // WriteRawVarint 写入原始 varint 字节（用于未知字段透传）。
 func (e *Encoder) WriteRawVarint(b []byte) { e.buf = append(e.buf, b...) }
+
+// WriteRaw 原样写入任意已编码字节（用于未知字段逐字节透传）。
+func (e *Encoder) WriteRaw(b []byte) { e.buf = append(e.buf, b...) }
 
 // WriteUvarint 写入无符号 varint。
 func (e *Encoder) WriteUvarint(v uint64) {
@@ -136,6 +147,7 @@ func (e *Encoder) WriteVersion(v int) { e.WriteUvarint(uint64(v)) }
 type Decoder struct {
 	data []byte
 	off  int
+	lim  *limitState // nil 表示不限制
 }
 
 // NewDecoder 基于完整数据创建解码器。
@@ -143,6 +155,12 @@ func NewDecoder(data []byte) *Decoder { return &Decoder{data: data} }
 
 // Done 报告数据是否已消费完毕。
 func (d *Decoder) Done() bool { return d.off >= len(d.data) }
+
+// Offset 返回当前读取偏移（配合 RawSince 捕获字段原始字节）。
+func (d *Decoder) Offset() int { return d.off }
+
+// RawSince 返回从偏移 start 到当前偏移的原始字节切片。
+func (d *Decoder) RawSince(start int) []byte { return d.data[start:d.off] }
 
 // ReadUvarint 读取无符号 varint；数据不足或溢出返回 ErrCorrupt。
 func (d *Decoder) ReadUvarint() (uint64, error) {
@@ -195,7 +213,11 @@ func (d *Decoder) ReadBool() (bool, error) {
 }
 
 // ReadTag 读取字段标签，返回字段编号与线上类型。
+// 解码器带字段数上限时，每次读取计入并可能返回 ErrLimitExceeded。
 func (d *Decoder) ReadTag() (int, WireType, error) {
+	if err := d.countField(); err != nil {
+		return 0, 0, err
+	}
 	u, err := d.ReadUvarint()
 	if err != nil {
 		return 0, 0, err
