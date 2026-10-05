@@ -8,7 +8,12 @@
 //	  wt==TypeVarint: varint(value)
 //	  wt==TypeBytes:  varint(len) + 原始字节
 //
-// 解码时遇到的未知字段被完整保留，重新编码时原样写回。
+// 解码时遇到的未知字段（含编号已知、但在数据自带版本下无效的字段）被完整
+// 保留为“标签+载荷”的原始字节，重新编码时按原始出现位置交错写回，网关中转
+// 可做到与上游报文逐字节一致（含非紧凑 varint/长度/版本头写法）。
+//
+// 三类互不从属的解码错误：ErrIncompatibleVersion（版本越界）、
+// ErrCorrupt（数据损坏）、ErrResourceLimit（报文超过 Limits 上限）。
 package wire
 
 import (
@@ -34,10 +39,16 @@ const (
 
 // UnknownField 保存解码时遇到、但当前 schema 版本未知的字段，
 // 重新编码时原样写回。
+//
+// 保真规则：当 Raw 非空时，它保存该字段“标签 + 载荷”的完整原始字节
+// （包含对端可能使用的非紧凑 varint、非紧凑长度前缀），重新编码时逐字节
+// 写回；Raw 为空时退化为仅由 Data 重建（向后兼容手动构造的用法，但此时
+// 标签与长度前缀会按紧凑形式重写）。
 type UnknownField struct {
 	Number int
 	Type   WireType
 	Data   []byte // varint 的原始字节，或 length-delimited 的载荷
+	Raw    []byte // 标签 + 载荷的完整原始字节（优先于 Data 使用）
 }
 
 // UnknownSet 是未知字段集合，按解码出现顺序保留。
@@ -45,19 +56,44 @@ type UnknownSet struct {
 	Fields []UnknownField
 }
 
+// 字段槽类别：解码时按线上出现顺序记录每个字段是“已知字段”还是
+// “未知字段”，重新编码时据此把未知字段插回原始位置，保证整报文逐字节一致。
+const (
+	SlotKnown   uint8 = 1
+	SlotUnknown uint8 = 2
+)
+
+// FieldSlot 记录解码流中的一个字段位置。
+// Kind=SlotKnown 时 Index 为该字段在 schema 字段序号（按编号升序，从 0 起）；
+// Kind=SlotUnknown 时 Index 为 UnknownSet.Fields 的下标。
+type FieldSlot struct {
+	Kind  uint8
+	Index int
+}
+
 // Add 记录一个未知字段。
 func (u *UnknownSet) Add(f UnknownField) { u.Fields = append(u.Fields, f) }
 
-// EncodeTo 将全部未知字段按原顺序写入编码器。
+// EncodeTo 将全部未知字段按原顺序写入编码器；优先逐字节还原 Raw。
 func (u *UnknownSet) EncodeTo(e *Encoder) {
-	for _, f := range u.Fields {
-		e.WriteTag(f.Number, f.Type)
-		switch f.Type {
-		case TypeVarint:
-			e.WriteRawVarint(f.Data)
-		case TypeBytes:
-			e.WriteBytes(f.Data)
-		}
+	for i := range u.Fields {
+		u.EncodeFieldTo(e, i)
+	}
+}
+
+// EncodeFieldTo 将第 idx 个未知字段写入编码器（供按原始位置交错回放）。
+func (u *UnknownSet) EncodeFieldTo(e *Encoder, idx int) {
+	f := u.Fields[idx]
+	if len(f.Raw) > 0 {
+		e.WriteRaw(f.Raw)
+		return
+	}
+	e.WriteTag(f.Number, f.Type)
+	switch f.Type {
+	case TypeVarint:
+		e.WriteRawVarint(f.Data)
+	case TypeBytes:
+		e.WriteBytes(f.Data)
 	}
 }
 
@@ -82,6 +118,9 @@ func NewEncoder() *Encoder { return &Encoder{} }
 
 // Bytes 返回已编码的字节。
 func (e *Encoder) Bytes() []byte { return e.buf }
+
+// WriteRaw 写入任意原始字节（用于未知字段整段逐字节透传）。
+func (e *Encoder) WriteRaw(b []byte) { e.buf = append(e.buf, b...) }
 
 // WriteRawVarint 写入原始 varint 字节（用于未知字段透传）。
 func (e *Encoder) WriteRawVarint(b []byte) { e.buf = append(e.buf, b...) }
@@ -134,12 +173,48 @@ func (e *Encoder) WriteVersion(v int) { e.WriteUvarint(uint64(v)) }
 
 // Decoder 增量读取编码数据。
 type Decoder struct {
-	data []byte
-	off  int
+	data   []byte
+	off    int
+	limits Limits // 本次解码（含全部嵌套层）的资源上限
+	depth  int    // 当前消息所处层级：顶层为 1
+	fields int    // 当前层已读出的字段个数
 }
 
-// NewDecoder 基于完整数据创建解码器。
-func NewDecoder(data []byte) *Decoder { return &Decoder{data: data} }
+// NewDecoder 基于完整数据创建解码器，不启用任何资源上限
+// （既有行为：仅防数据损坏，不防超大/超深报文）。
+func NewDecoder(data []byte) *Decoder {
+	return &Decoder{data: data, depth: 1}
+}
+
+// NewLimitedDecoder 基于完整数据创建带资源上限的解码器。
+// limits 为值拷贝，与其他并发解码互不影响。data 长度超过 MaxBytes 时
+// 返回 ErrResourceLimit（此时不会消费任何数据）。
+func NewLimitedDecoder(data []byte, limits Limits) (*Decoder, error) {
+	if err := limits.checkBytes(len(data)); err != nil {
+		return nil, err
+	}
+	return &Decoder{data: data, limits: limits, depth: 1}, nil
+}
+
+// Child 为嵌套消息的载荷 raw 创建下一层解码器，沿用同一份上限配置。
+// 嵌套层数超过 MaxDepth、或载荷超过 MaxBytes 时返回 ErrResourceLimit。
+func (d *Decoder) Child(raw []byte) (*Decoder, error) {
+	child := &Decoder{data: raw, limits: d.limits, depth: d.depth + 1}
+	if err := d.limits.checkDepth(child.depth); err != nil {
+		return nil, err
+	}
+	if err := d.limits.checkBytes(len(raw)); err != nil {
+		return nil, err
+	}
+	return child, nil
+}
+
+// Offset 返回当前已消费到的字节偏移（用于捕获字段的完整原始字节区间）。
+func (d *Decoder) Offset() int { return d.off }
+
+// RawField 从字段起始偏移 start 到当前偏移的完整原始字节
+// （标签 + 载荷，含原始 varint/长度写法）。
+func (d *Decoder) RawField(start int) []byte { return d.data[start:d.off] }
 
 // Done 报告数据是否已消费完毕。
 func (d *Decoder) Done() bool { return d.off >= len(d.data) }
@@ -208,6 +283,10 @@ func (d *Decoder) ReadTag() (int, WireType, error) {
 	if wt != TypeVarint && wt != TypeBytes {
 		return 0, 0, fmt.Errorf("%w: 未知线上类型 %d", ErrCorrupt, wt)
 	}
+	d.fields++
+	if err := d.limits.checkFields(d.fields); err != nil {
+		return 0, 0, err
+	}
 	return num, wt, nil
 }
 
@@ -242,4 +321,15 @@ func (d *Decoder) ReadVersion() (int, error) {
 		return 0, err
 	}
 	return int(u), nil
+}
+
+// ReadVersionRaw 读取消息版本头，并同时返回版本头 varint 的原始字节
+// （对端可能使用了非紧凑写法），供网关以相同版本中转时逐字节还原。
+func (d *Decoder) ReadVersionRaw() (int, []byte, error) {
+	start := d.off
+	v, err := d.ReadVersion()
+	if err != nil {
+		return 0, nil, err
+	}
+	return v, d.data[start:d.off], nil
 }

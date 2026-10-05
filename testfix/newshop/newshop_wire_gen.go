@@ -22,6 +22,9 @@ type User struct {
 	Active        bool
 	Avatar        []byte
 	UnknownFields wire.UnknownSet
+	dataVersion   int
+	versionRaw    []byte
+	fieldOrder    []wire.FieldSlot
 }
 
 // Encode 以最大支持版本编码。
@@ -30,114 +33,382 @@ func (m *User) Encode() ([]byte, error) {
 }
 
 // EncodeVersion 以指定版本编码；版本越界返回 wire.ErrIncompatibleVersion。
+// 若该消息由 Decode/DecodeWith 得到且目标版本等于数据自带版本，则版本头与
+// 未知字段（含非紧凑 varint/长度写法）按线上原始字节与原始位置逐字节回放。
 func (m *User) EncodeVersion(v int) ([]byte, error) {
 	if err := wire.CheckVersion(v, UserMinVersion, UserMaxVersion); err != nil {
 		return nil, err
 	}
 	e := wire.NewEncoder()
-	e.WriteVersion(v)
-	if v >= 1 {
-		e.WriteTag(1, wire.TypeBytes)
-		e.WriteString(m.Name)
+	if m.dataVersion == v && len(m.versionRaw) > 0 {
+		e.WriteRaw(m.versionRaw)
+	} else {
+		e.WriteVersion(v)
 	}
-	if v >= 1 && v <= 2 {
-		e.WriteTag(2, wire.TypeVarint)
-		e.WriteInt64(int64(m.Age))
+	var encErr error
+	emitField := func(i int) {
+		if encErr != nil {
+			return
+		}
+		switch i {
+		case 0:
+			if v >= 1 {
+				e.WriteTag(1, wire.TypeBytes)
+				e.WriteString(m.Name)
+			}
+		case 1:
+			if v >= 1 && v <= 2 {
+				e.WriteTag(2, wire.TypeVarint)
+				e.WriteInt64(int64(m.Age))
+			}
+		case 2:
+			if v >= 2 {
+				e.WriteTag(3, wire.TypeBytes)
+				e.WriteString(m.Email)
+			}
+		case 3:
+			if v >= 1 {
+				e.WriteTag(4, wire.TypeVarint)
+				e.WriteBool(m.Active)
+			}
+		case 4:
+			if v >= 3 {
+				e.WriteTag(5, wire.TypeBytes)
+				e.WriteBytes(m.Avatar)
+			}
+		}
 	}
-	if v >= 2 {
-		e.WriteTag(3, wire.TypeBytes)
-		e.WriteString(m.Email)
+	if len(m.fieldOrder) > 0 {
+		unknownEmitted := 0
+		for _, slot := range m.fieldOrder {
+			switch slot.Kind {
+			case wire.SlotKnown:
+				emitField(slot.Index)
+			case wire.SlotUnknown:
+				if slot.Index < len(m.UnknownFields.Fields) {
+					m.UnknownFields.EncodeFieldTo(e, slot.Index)
+					unknownEmitted++
+				}
+			}
+			if encErr != nil {
+				return nil, encErr
+			}
+		}
+		for i := unknownEmitted; i < len(m.UnknownFields.Fields); i++ {
+			m.UnknownFields.EncodeFieldTo(e, i)
+		}
+	} else {
+		for i := 0; i < 5; i++ {
+			emitField(i)
+			if encErr != nil {
+				return nil, encErr
+			}
+		}
+		m.UnknownFields.EncodeTo(e)
 	}
-	if v >= 1 {
-		e.WriteTag(4, wire.TypeVarint)
-		e.WriteBool(m.Active)
-	}
-	if v >= 3 {
-		e.WriteTag(5, wire.TypeBytes)
-		e.WriteBytes(m.Avatar)
-	}
-	m.UnknownFields.EncodeTo(e)
 	return e.Bytes(), nil
 }
 
-// Decode 解码数据；版本不兼容返回 wire.ErrIncompatibleVersion，
-// 截断/越界等损坏数据返回 wire.ErrCorrupt。未知字段保留在 UnknownFields。
+// Decode 以无资源上限的方式解码（等价于 DecodeWith(data, wire.Limits{})）。
+// 版本不兼容返回 wire.ErrIncompatibleVersion，截断/越界等损坏数据返回
+// wire.ErrCorrupt；只有在数据自带版本下确实有效的字段才按已知字段处理，
+// 其余字段（含编号已知但该版本无效的字段）一律作为未知字段逐字节保留。
 func (m *User) Decode(data []byte) error {
-	d := wire.NewDecoder(data)
-	v, err := d.ReadVersion()
+	return m.DecodeWith(data, wire.Limits{})
+}
+
+// DecodeWith 按给定资源上限解码；超限返回 wire.ErrResourceLimit。
+// limits 按值传入，并发解码多条报文时各自配置互不影响。
+func (m *User) DecodeWith(data []byte, limits wire.Limits) error {
+	d, err := wire.NewLimitedDecoder(data, limits)
+	if err != nil {
+		return err
+	}
+	return m.decodeFrom(d)
+}
+
+// decodeFrom 从已有解码器（可能是嵌套消息的子解码器）读取消息体。
+func (m *User) decodeFrom(d *wire.Decoder) error {
+	v, vraw, err := d.ReadVersionRaw()
 	if err != nil {
 		return err
 	}
 	if err := wire.CheckVersion(v, UserMinVersion, UserMaxVersion); err != nil {
 		return err
 	}
+	m.dataVersion = v
+	m.versionRaw = vraw
 	m.UnknownFields = wire.UnknownSet{}
+	m.fieldOrder = m.fieldOrder[:0]
 	for !d.Done() {
+		start := d.Offset()
 		num, wt, err := d.ReadTag()
 		if err != nil {
 			return err
 		}
+		known := false
 		switch num {
 		case 1:
-			if wt != wire.TypeBytes {
-				return fmt.Errorf("%w: 字段 1 线上类型不符", wire.ErrCorrupt)
-			}
-			val, err := d.ReadString()
-			if err != nil {
-				return err
-			}
-			m.Name = val
-		case 2:
-			if wt != wire.TypeVarint {
-				return fmt.Errorf("%w: 字段 2 线上类型不符", wire.ErrCorrupt)
-			}
-			val, err := d.ReadInt64()
-			if err != nil {
-				return err
-			}
-			m.Age = int32(val)
-		case 3:
-			if wt != wire.TypeBytes {
-				return fmt.Errorf("%w: 字段 3 线上类型不符", wire.ErrCorrupt)
-			}
-			val, err := d.ReadString()
-			if err != nil {
-				return err
-			}
-			m.Email = val
-		case 4:
-			if wt != wire.TypeVarint {
-				return fmt.Errorf("%w: 字段 4 线上类型不符", wire.ErrCorrupt)
-			}
-			val, err := d.ReadBool()
-			if err != nil {
-				return err
-			}
-			m.Active = val
-		case 5:
-			if wt != wire.TypeBytes {
-				return fmt.Errorf("%w: 字段 5 线上类型不符", wire.ErrCorrupt)
-			}
-			val, err := d.ReadBytes()
-			if err != nil {
-				return err
-			}
-			m.Avatar = val
-		default:
-			switch wt {
-			case wire.TypeVarint:
-				raw, err := d.ReadRawVarint()
+			if v >= 1 {
+				known = true
+				m.fieldOrder = append(m.fieldOrder, wire.FieldSlot{Kind: wire.SlotKnown, Index: 0})
+				if wt != wire.TypeBytes {
+					return fmt.Errorf("%w: 字段 1 线上类型不符", wire.ErrCorrupt)
+				}
+				val, err := d.ReadString()
 				if err != nil {
 					return err
 				}
-				m.UnknownFields.Add(wire.UnknownField{Number: num, Type: wt, Data: raw})
+				m.Name = val
+			}
+		case 2:
+			if v >= 1 && v <= 2 {
+				known = true
+				m.fieldOrder = append(m.fieldOrder, wire.FieldSlot{Kind: wire.SlotKnown, Index: 1})
+				if wt != wire.TypeVarint {
+					return fmt.Errorf("%w: 字段 2 线上类型不符", wire.ErrCorrupt)
+				}
+				val, err := d.ReadInt64()
+				if err != nil {
+					return err
+				}
+				m.Age = int32(val)
+			}
+		case 3:
+			if v >= 2 {
+				known = true
+				m.fieldOrder = append(m.fieldOrder, wire.FieldSlot{Kind: wire.SlotKnown, Index: 2})
+				if wt != wire.TypeBytes {
+					return fmt.Errorf("%w: 字段 3 线上类型不符", wire.ErrCorrupt)
+				}
+				val, err := d.ReadString()
+				if err != nil {
+					return err
+				}
+				m.Email = val
+			}
+		case 4:
+			if v >= 1 {
+				known = true
+				m.fieldOrder = append(m.fieldOrder, wire.FieldSlot{Kind: wire.SlotKnown, Index: 3})
+				if wt != wire.TypeVarint {
+					return fmt.Errorf("%w: 字段 4 线上类型不符", wire.ErrCorrupt)
+				}
+				val, err := d.ReadBool()
+				if err != nil {
+					return err
+				}
+				m.Active = val
+			}
+		case 5:
+			if v >= 3 {
+				known = true
+				m.fieldOrder = append(m.fieldOrder, wire.FieldSlot{Kind: wire.SlotKnown, Index: 4})
+				if wt != wire.TypeBytes {
+					return fmt.Errorf("%w: 字段 5 线上类型不符", wire.ErrCorrupt)
+				}
+				val, err := d.ReadBytes()
+				if err != nil {
+					return err
+				}
+				m.Avatar = val
+			}
+		}
+		if !known {
+			switch wt {
+			case wire.TypeVarint:
+				if _, err := d.ReadRawVarint(); err != nil {
+					return err
+				}
 			case wire.TypeBytes:
+				if _, err := d.ReadBytes(); err != nil {
+					return err
+				}
+			}
+			m.UnknownFields.Add(wire.UnknownField{Number: num, Type: wt, Raw: d.RawField(start)})
+			m.fieldOrder = append(m.fieldOrder, wire.FieldSlot{Kind: wire.SlotUnknown, Index: len(m.UnknownFields.Fields) - 1})
+		}
+	}
+	return nil
+}
+
+// Envelope 支持的版本区间。
+const (
+	EnvelopeMinVersion = 1
+	EnvelopeMaxVersion = 1
+)
+
+// Envelope 由 schema 生成。
+type Envelope struct {
+	User          *User
+	Tag           string
+	UnknownFields wire.UnknownSet
+	dataVersion   int
+	versionRaw    []byte
+	fieldOrder    []wire.FieldSlot
+}
+
+// Encode 以最大支持版本编码。
+func (m *Envelope) Encode() ([]byte, error) {
+	return m.EncodeVersion(EnvelopeMaxVersion)
+}
+
+// EncodeVersion 以指定版本编码；版本越界返回 wire.ErrIncompatibleVersion。
+// 若该消息由 Decode/DecodeWith 得到且目标版本等于数据自带版本，则版本头与
+// 未知字段（含非紧凑 varint/长度写法）按线上原始字节与原始位置逐字节回放。
+func (m *Envelope) EncodeVersion(v int) ([]byte, error) {
+	if err := wire.CheckVersion(v, EnvelopeMinVersion, EnvelopeMaxVersion); err != nil {
+		return nil, err
+	}
+	e := wire.NewEncoder()
+	if m.dataVersion == v && len(m.versionRaw) > 0 {
+		e.WriteRaw(m.versionRaw)
+	} else {
+		e.WriteVersion(v)
+	}
+	var encErr error
+	emitField := func(i int) {
+		if encErr != nil {
+			return
+		}
+		switch i {
+		case 0:
+			if v >= 1 {
+				if m.User != nil {
+					e.WriteTag(1, wire.TypeBytes)
+					inner, err := m.User.EncodeVersion(v)
+					if err != nil {
+						encErr = err
+						return
+					}
+					e.WriteBytes(inner)
+				}
+			}
+		case 1:
+			if v >= 1 {
+				e.WriteTag(2, wire.TypeBytes)
+				e.WriteString(m.Tag)
+			}
+		}
+	}
+	if len(m.fieldOrder) > 0 {
+		unknownEmitted := 0
+		for _, slot := range m.fieldOrder {
+			switch slot.Kind {
+			case wire.SlotKnown:
+				emitField(slot.Index)
+			case wire.SlotUnknown:
+				if slot.Index < len(m.UnknownFields.Fields) {
+					m.UnknownFields.EncodeFieldTo(e, slot.Index)
+					unknownEmitted++
+				}
+			}
+			if encErr != nil {
+				return nil, encErr
+			}
+		}
+		for i := unknownEmitted; i < len(m.UnknownFields.Fields); i++ {
+			m.UnknownFields.EncodeFieldTo(e, i)
+		}
+	} else {
+		for i := 0; i < 2; i++ {
+			emitField(i)
+			if encErr != nil {
+				return nil, encErr
+			}
+		}
+		m.UnknownFields.EncodeTo(e)
+	}
+	return e.Bytes(), nil
+}
+
+// Decode 以无资源上限的方式解码（等价于 DecodeWith(data, wire.Limits{})）。
+// 版本不兼容返回 wire.ErrIncompatibleVersion，截断/越界等损坏数据返回
+// wire.ErrCorrupt；只有在数据自带版本下确实有效的字段才按已知字段处理，
+// 其余字段（含编号已知但该版本无效的字段）一律作为未知字段逐字节保留。
+func (m *Envelope) Decode(data []byte) error {
+	return m.DecodeWith(data, wire.Limits{})
+}
+
+// DecodeWith 按给定资源上限解码；超限返回 wire.ErrResourceLimit。
+// limits 按值传入，并发解码多条报文时各自配置互不影响。
+func (m *Envelope) DecodeWith(data []byte, limits wire.Limits) error {
+	d, err := wire.NewLimitedDecoder(data, limits)
+	if err != nil {
+		return err
+	}
+	return m.decodeFrom(d)
+}
+
+// decodeFrom 从已有解码器（可能是嵌套消息的子解码器）读取消息体。
+func (m *Envelope) decodeFrom(d *wire.Decoder) error {
+	v, vraw, err := d.ReadVersionRaw()
+	if err != nil {
+		return err
+	}
+	if err := wire.CheckVersion(v, EnvelopeMinVersion, EnvelopeMaxVersion); err != nil {
+		return err
+	}
+	m.dataVersion = v
+	m.versionRaw = vraw
+	m.UnknownFields = wire.UnknownSet{}
+	m.fieldOrder = m.fieldOrder[:0]
+	for !d.Done() {
+		start := d.Offset()
+		num, wt, err := d.ReadTag()
+		if err != nil {
+			return err
+		}
+		known := false
+		switch num {
+		case 1:
+			if v >= 1 {
+				known = true
+				m.fieldOrder = append(m.fieldOrder, wire.FieldSlot{Kind: wire.SlotKnown, Index: 0})
+				if wt != wire.TypeBytes {
+					return fmt.Errorf("%w: 字段 1 线上类型不符", wire.ErrCorrupt)
+				}
 				raw, err := d.ReadBytes()
 				if err != nil {
 					return err
 				}
-				m.UnknownFields.Add(wire.UnknownField{Number: num, Type: wt, Data: raw})
+				inner := &User{}
+				cd, err := d.Child(raw)
+				if err != nil {
+					return err
+				}
+				if err := inner.decodeFrom(cd); err != nil {
+					return err
+				}
+				m.User = inner
 			}
+		case 2:
+			if v >= 1 {
+				known = true
+				m.fieldOrder = append(m.fieldOrder, wire.FieldSlot{Kind: wire.SlotKnown, Index: 1})
+				if wt != wire.TypeBytes {
+					return fmt.Errorf("%w: 字段 2 线上类型不符", wire.ErrCorrupt)
+				}
+				val, err := d.ReadString()
+				if err != nil {
+					return err
+				}
+				m.Tag = val
+			}
+		}
+		if !known {
+			switch wt {
+			case wire.TypeVarint:
+				if _, err := d.ReadRawVarint(); err != nil {
+					return err
+				}
+			case wire.TypeBytes:
+				if _, err := d.ReadBytes(); err != nil {
+					return err
+				}
+			}
+			m.UnknownFields.Add(wire.UnknownField{Number: num, Type: wt, Raw: d.RawField(start)})
+			m.fieldOrder = append(m.fieldOrder, wire.FieldSlot{Kind: wire.SlotUnknown, Index: len(m.UnknownFields.Fields) - 1})
 		}
 	}
 	return nil

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/lisama569/schema-wire-sdk-go/schema"
@@ -19,7 +20,12 @@ type Options struct {
 
 // Generate 生成目标文件集合（文件名 -> 内容）。
 // 同一 schema 多次生成的结果逐字节一致；schema 校验未通过或生成失败时
-// 不返回任何部分结果。Generate 不持有共享状态，可并发调用。
+// 不返回任何部分结果。Generate 不持有请求级共享状态，可并发调用。
+//
+// 在返回前还会做一次“可编译性预检”：有些 schema 能通过解析与语义校验，
+// 但生成出来的 Go 包编译不过（如字段名是 Go 关键字、两个字段导出后同名、
+// 字段名撞上 SDK 保留方法名等）；这类问题在此以 *UncompilableError 返回，
+// 不会把坏产物交给调用方或写盘。
 func Generate(f *schema.File, opts Options) (map[string][]byte, error) {
 	if err := schema.Validate(f); err != nil {
 		return nil, fmt.Errorf("schema 校验未通过，不产出任何生成结果: %w", err)
@@ -42,7 +48,11 @@ func Generate(f *schema.File, opts Options) (map[string][]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("生成代码格式化失败: %w", err)
 	}
-	return map[string][]byte{pkg + "_wire_gen.go": src}, nil
+	files := map[string][]byte{pkg + "_wire_gen.go": src}
+	if err := ensureCompilable(f, pkg, files); err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 // sortedFields 返回按字段编号升序排列的字段（保证产物确定）。
@@ -92,7 +102,13 @@ func emitMessage(b *strings.Builder, m *schema.Message) {
 	for _, f := range fields {
 		fmt.Fprintf(b, "\t%s %s\n", schema.ExportedName(f.Name), goType(f.Type))
 	}
-	b.WriteString("\tUnknownFields wire.UnknownSet\n}\n")
+	b.WriteString("\tUnknownFields wire.UnknownSet\n")
+	// 解码元数据（不导出）：数据自带版本、版本头原始字节、字段出现顺序，
+	// 用于中转场景严格按原顺序、原字节重新编码。
+	b.WriteString("\tdataVersion int\n")
+	b.WriteString("\tversionRaw  []byte\n")
+	b.WriteString("\tfieldOrder  []wire.FieldSlot\n")
+	b.WriteString("}\n")
 
 	emitEncode(b, m, fields)
 	emitDecode(b, m, fields)
@@ -113,76 +129,147 @@ func emitEncode(b *strings.Builder, m *schema.Message, fields []*schema.Field) {
 		m.Name, m.Name)
 
 	fmt.Fprintf(b, "\n// EncodeVersion 以指定版本编码；版本越界返回 wire.ErrIncompatibleVersion。\n")
+	fmt.Fprintf(b, "// 若该消息由 Decode/DecodeWith 得到且目标版本等于数据自带版本，则版本头与\n")
+	fmt.Fprintf(b, "// 未知字段（含非紧凑 varint/长度写法）按线上原始字节与原始位置逐字节回放。\n")
 	fmt.Fprintf(b, "func (m *%s) EncodeVersion(v int) ([]byte, error) {\n", m.Name)
 	fmt.Fprintf(b, "\tif err := wire.CheckVersion(v, %sMinVersion, %sMaxVersion); err != nil {\n\t\treturn nil, err\n\t}\n",
 		m.Name, m.Name)
-	b.WriteString("\te := wire.NewEncoder()\n\te.WriteVersion(v)\n")
-	for _, f := range fields {
+	b.WriteString("\te := wire.NewEncoder()\n")
+	// 版本头：同版本中转时还原原始字节（可能非紧凑）；换版本则紧凑重写。
+	b.WriteString("\tif m.dataVersion == v && len(m.versionRaw) > 0 {\n")
+	b.WriteString("\t\te.WriteRaw(m.versionRaw)\n")
+	b.WriteString("\t} else {\n")
+	b.WriteString("\t\te.WriteVersion(v)\n")
+	b.WriteString("\t}\n")
+
+	// emitField(i)：按目标版本写出第 i 个 schema 字段（fields 已按编号升序）。
+	b.WriteString("\tvar encErr error\n")
+	b.WriteString("\temitField := func(i int) {\n\t\tif encErr != nil {\n\t\t\treturn\n\t\t}\n\t\tswitch i {\n")
+	for i, f := range fields {
 		name := schema.ExportedName(f.Name)
-		fmt.Fprintf(b, "\tif %s {\n", fieldActive(f))
-		fmt.Fprintf(b, "\t\te.WriteTag(%d, %s)\n", f.Number, wireTypeOf(f.Type))
-		switch f.Type {
-		case "int32":
-			fmt.Fprintf(b, "\t\te.WriteInt64(int64(m.%s))\n", name)
-		case "int64":
-			fmt.Fprintf(b, "\t\te.WriteInt64(m.%s)\n", name)
-		case "bool":
-			fmt.Fprintf(b, "\t\te.WriteBool(m.%s)\n", name)
-		case "string":
-			fmt.Fprintf(b, "\t\te.WriteString(m.%s)\n", name)
-		case "bytes":
-			fmt.Fprintf(b, "\t\te.WriteBytes(m.%s)\n", name)
-		default: // 嵌套消息
-			fmt.Fprintf(b, "\t\tinner, err := m.%s.EncodeVersion(v)\n\t\tif err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t\te.WriteBytes(inner)\n", name)
+		fmt.Fprintf(b, "\t\tcase %d:\n", i)
+		fmt.Fprintf(b, "\t\t\tif %s {\n", fieldActive(f))
+		if schema.IsBuiltin(f.Type) {
+			// 标量字段：标签 + 值。
+			fmt.Fprintf(b, "\t\t\t\te.WriteTag(%d, %s)\n", f.Number, wireTypeOf(f.Type))
+			switch f.Type {
+			case "int32":
+				fmt.Fprintf(b, "\t\t\t\te.WriteInt64(int64(m.%s))\n", name)
+			case "int64":
+				fmt.Fprintf(b, "\t\t\t\te.WriteInt64(m.%s)\n", name)
+			case "bool":
+				fmt.Fprintf(b, "\t\t\t\te.WriteBool(m.%s)\n", name)
+			case "string":
+				fmt.Fprintf(b, "\t\t\t\te.WriteString(m.%s)\n", name)
+			case "bytes":
+				fmt.Fprintf(b, "\t\t\t\te.WriteBytes(m.%s)\n", name)
+			}
+		} else { // 嵌套消息：nil 时整段（含标签）不发射，避免产出非法报文
+			fmt.Fprintf(b, "\t\t\t\tif m.%s != nil {\n", name)
+			fmt.Fprintf(b, "\t\t\t\t\te.WriteTag(%d, %s)\n", f.Number, wireTypeOf(f.Type))
+			b.WriteString("\t\t\t\t\tinner, err := ")
+			fmt.Fprintf(b, "m.%s.EncodeVersion(v)\n", name)
+			b.WriteString("\t\t\t\t\tif err != nil {\n\t\t\t\t\t\tencErr = err\n\t\t\t\t\t\treturn\n\t\t\t\t\t}\n")
+			b.WriteString("\t\t\t\t\te.WriteBytes(inner)\n")
+			b.WriteString("\t\t\t\t}\n")
 		}
-		b.WriteString("\t}\n")
+		b.WriteString("\t\t\t}\n")
 	}
-	b.WriteString("\tm.UnknownFields.EncodeTo(e)\n\treturn e.Bytes(), nil\n}\n")
+	b.WriteString("\t\t}\n\t}\n")
+
+	// 解码得到的消息：按字段原始出现顺序交错回放已知/未知字段。
+	b.WriteString("\tif len(m.fieldOrder) > 0 {\n")
+	b.WriteString("\t\tunknownEmitted := 0\n")
+	b.WriteString("\t\tfor _, slot := range m.fieldOrder {\n")
+	b.WriteString("\t\t\tswitch slot.Kind {\n")
+	b.WriteString("\t\t\tcase wire.SlotKnown:\n")
+	b.WriteString("\t\t\t\temitField(slot.Index)\n")
+	b.WriteString("\t\t\tcase wire.SlotUnknown:\n")
+	b.WriteString("\t\t\t\tif slot.Index < len(m.UnknownFields.Fields) {\n")
+	b.WriteString("\t\t\t\t\tm.UnknownFields.EncodeFieldTo(e, slot.Index)\n")
+	b.WriteString("\t\t\t\t\tunknownEmitted++\n")
+	b.WriteString("\t\t\t\t}\n")
+	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t\tif encErr != nil {\n\t\t\t\treturn nil, encErr\n\t\t\t}\n")
+	b.WriteString("\t\t}\n")
+	// 解码后由程序新追加的未知字段（不在 fieldOrder 中）补在末尾。
+	b.WriteString("\t\tfor i := unknownEmitted; i < len(m.UnknownFields.Fields); i++ {\n")
+	b.WriteString("\t\t\tm.UnknownFields.EncodeFieldTo(e, i)\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t} else {\n")
+	// 程序内新构造的消息：按编号升序输出已知字段，再追加全部未知字段。
+	b.WriteString("\t\tfor i := 0; i < " + strconv.Itoa(len(fields)) + "; i++ {\n\t\t\temitField(i)\n\t\t\tif encErr != nil {\n\t\t\t\treturn nil, encErr\n\t\t\t}\n\t\t}\n")
+	b.WriteString("\t\tm.UnknownFields.EncodeTo(e)\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\treturn e.Bytes(), nil\n}\n")
 }
 
 func emitDecode(b *strings.Builder, m *schema.Message, fields []*schema.Field) {
-	fmt.Fprintf(b, "\n// Decode 解码数据；版本不兼容返回 wire.ErrIncompatibleVersion，\n")
-	fmt.Fprintf(b, "// 截断/越界等损坏数据返回 wire.ErrCorrupt。未知字段保留在 UnknownFields。\n")
-	fmt.Fprintf(b, "func (m *%s) Decode(data []byte) error {\n", m.Name)
-	b.WriteString("\td := wire.NewDecoder(data)\n")
-	b.WriteString("\tv, err := d.ReadVersion()\n\tif err != nil {\n\t\treturn err\n\t}\n")
+	fmt.Fprintf(b, "\n// Decode 以无资源上限的方式解码（等价于 DecodeWith(data, wire.Limits{})）。\n")
+	fmt.Fprintf(b, "// 版本不兼容返回 wire.ErrIncompatibleVersion，截断/越界等损坏数据返回\n")
+	fmt.Fprintf(b, "// wire.ErrCorrupt；只有在数据自带版本下确实有效的字段才按已知字段处理，\n")
+	fmt.Fprintf(b, "// 其余字段（含编号已知但该版本无效的字段）一律作为未知字段逐字节保留。\n")
+	fmt.Fprintf(b, "func (m *%s) Decode(data []byte) error {\n\treturn m.DecodeWith(data, wire.Limits{})\n}\n", m.Name)
+
+	fmt.Fprintf(b, "\n// DecodeWith 按给定资源上限解码；超限返回 wire.ErrResourceLimit。\n")
+	fmt.Fprintf(b, "// limits 按值传入，并发解码多条报文时各自配置互不影响。\n")
+	fmt.Fprintf(b, "func (m *%s) DecodeWith(data []byte, limits wire.Limits) error {\n", m.Name)
+	b.WriteString("\td, err := wire.NewLimitedDecoder(data, limits)\n\tif err != nil {\n\t\treturn err\n\t}\n")
+	b.WriteString("\treturn m.decodeFrom(d)\n}\n")
+
+	fmt.Fprintf(b, "\n// decodeFrom 从已有解码器（可能是嵌套消息的子解码器）读取消息体。\n")
+	fmt.Fprintf(b, "func (m *%s) decodeFrom(d *wire.Decoder) error {\n", m.Name)
+	b.WriteString("\tv, vraw, err := d.ReadVersionRaw()\n\tif err != nil {\n\t\treturn err\n\t}\n")
 	fmt.Fprintf(b, "\tif err := wire.CheckVersion(v, %sMinVersion, %sMaxVersion); err != nil {\n\t\treturn err\n\t}\n",
 		m.Name, m.Name)
-	b.WriteString("\tm.UnknownFields = wire.UnknownSet{}\n")
+	b.WriteString("\tm.dataVersion = v\n\tm.versionRaw = vraw\n")
+	b.WriteString("\tm.UnknownFields = wire.UnknownSet{}\n\tm.fieldOrder = m.fieldOrder[:0]\n")
 	b.WriteString("\tfor !d.Done() {\n")
+	b.WriteString("\t\tstart := d.Offset()\n")
 	b.WriteString("\t\tnum, wt, err := d.ReadTag()\n\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+	b.WriteString("\t\tknown := false\n")
 	b.WriteString("\t\tswitch num {\n")
-	for _, f := range fields {
+	for ord, f := range fields {
 		name := schema.ExportedName(f.Name)
 		fmt.Fprintf(b, "\t\tcase %d:\n", f.Number)
-		fmt.Fprintf(b, "\t\t\tif wt != %s {\n\t\t\t\treturn fmt.Errorf(\"%%w: 字段 %d 线上类型不符\", wire.ErrCorrupt)\n\t\t\t}\n",
+		// 只有数据自带版本下有效，才是“已知字段”；否则落入未知字段分支逐字节保留。
+		fmt.Fprintf(b, "\t\t\tif %s {\n\t\t\t\tknown = true\n", fieldActive(f))
+		fmt.Fprintf(b, "\t\t\t\tm.fieldOrder = append(m.fieldOrder, wire.FieldSlot{Kind: wire.SlotKnown, Index: %d})\n", ord)
+		fmt.Fprintf(b, "\t\t\t\tif wt != %s {\n\t\t\t\t\treturn fmt.Errorf(\"%%w: 字段 %d 线上类型不符\", wire.ErrCorrupt)\n\t\t\t\t}\n",
 			wireTypeOf(f.Type), f.Number)
 		switch f.Type {
 		case "int32":
-			fmt.Fprintf(b, "\t\t\tval, err := d.ReadInt64()\n\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t\tm.%s = int32(val)\n", name)
+			fmt.Fprintf(b, "\t\t\t\tval, err := d.ReadInt64()\n\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n\t\t\t\tm.%s = int32(val)\n", name)
 		case "int64":
-			fmt.Fprintf(b, "\t\t\tval, err := d.ReadInt64()\n\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t\tm.%s = val\n", name)
+			fmt.Fprintf(b, "\t\t\t\tval, err := d.ReadInt64()\n\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n\t\t\t\tm.%s = val\n", name)
 		case "bool":
-			fmt.Fprintf(b, "\t\t\tval, err := d.ReadBool()\n\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t\tm.%s = val\n", name)
+			fmt.Fprintf(b, "\t\t\t\tval, err := d.ReadBool()\n\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n\t\t\t\tm.%s = val\n", name)
 		case "string":
-			fmt.Fprintf(b, "\t\t\tval, err := d.ReadString()\n\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t\tm.%s = val\n", name)
+			fmt.Fprintf(b, "\t\t\t\tval, err := d.ReadString()\n\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n\t\t\t\tm.%s = val\n", name)
 		case "bytes":
-			fmt.Fprintf(b, "\t\t\tval, err := d.ReadBytes()\n\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t\tm.%s = val\n", name)
-		default: // 嵌套消息
-			fmt.Fprintf(b, "\t\t\traw, err := d.ReadBytes()\n\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
-			fmt.Fprintf(b, "\t\t\tinner := &%s{}\n\t\t\tif err := inner.Decode(raw); err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t\tm.%s = inner\n", f.Type, name)
+			fmt.Fprintf(b, "\t\t\t\tval, err := d.ReadBytes()\n\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n\t\t\t\tm.%s = val\n", name)
+		default: // 嵌套消息：创建子解码器以透传上限与嵌套层数
+			fmt.Fprintf(b, "\t\t\t\traw, err := d.ReadBytes()\n\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n")
+			fmt.Fprintf(b, "\t\t\t\tinner := &%s{}\n", f.Type)
+			b.WriteString("\t\t\t\tcd, err := d.Child(raw)\n\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n")
+			fmt.Fprintf(b, "\t\t\t\tif err := inner.decodeFrom(cd); err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n\t\t\t\tm.%s = inner\n", name)
 		}
+		b.WriteString("\t\t\t}\n")
 	}
-	b.WriteString("\t\tdefault:\n")
+	b.WriteString("\t\t}\n")
+	// 未知字段（含编号已知但在该版本无效的字段）：消费掉载荷后，
+	// 用从标签起点到当前偏移的整段原始字节记录，重编码时逐字节还原。
+	b.WriteString("\t\tif !known {\n")
 	b.WriteString("\t\t\tswitch wt {\n")
 	b.WriteString("\t\t\tcase wire.TypeVarint:\n")
-	b.WriteString("\t\t\t\traw, err := d.ReadRawVarint()\n\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n")
-	b.WriteString("\t\t\t\tm.UnknownFields.Add(wire.UnknownField{Number: num, Type: wt, Data: raw})\n")
+	b.WriteString("\t\t\t\tif _, err := d.ReadRawVarint(); err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n")
 	b.WriteString("\t\t\tcase wire.TypeBytes:\n")
-	b.WriteString("\t\t\t\traw, err := d.ReadBytes()\n\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n")
-	b.WriteString("\t\t\t\tm.UnknownFields.Add(wire.UnknownField{Number: num, Type: wt, Data: raw})\n")
+	b.WriteString("\t\t\t\tif _, err := d.ReadBytes(); err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n")
 	b.WriteString("\t\t\t}\n")
-	b.WriteString("\t\t}\n\t}\n\treturn nil\n}\n")
+	b.WriteString("\t\t\tm.UnknownFields.Add(wire.UnknownField{Number: num, Type: wt, Raw: d.RawField(start)})\n")
+	b.WriteString("\t\t\tm.fieldOrder = append(m.fieldOrder, wire.FieldSlot{Kind: wire.SlotUnknown, Index: len(m.UnknownFields.Fields) - 1})\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t}\n\treturn nil\n}\n")
 }
 
 // WriteFiles 将生成结果原子化写入目录：先全部写入临时文件，
